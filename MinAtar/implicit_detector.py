@@ -340,6 +340,68 @@ class ImplicitDetector:
         }
 
     # ------------------------------------------------------------------
+    # Serialisation -- used by FAME.py mid-training checkpointing
+    # ------------------------------------------------------------------
+    def state_dict(self) -> dict:
+        """Return a picklable snapshot of all mutable detector state.
+
+        Includes TSN weights + optimiser so the network can resume
+        training exactly where it left off on reload.
+        """
+        def _w(wf):
+            return {"n": wf.n, "mean": wf.mean, "M2": wf.M2}
+
+        return {
+            # TSN model + optimiser
+            "net": self.net.state_dict(),
+            "opt": self.opt.state_dict(),
+            # Replay buffer: list of (phi, action, reward, next_phi) tuples
+            "replay": list(self._replay),
+            # Score window and Welford accumulators
+            "scores": list(self._scores),
+            "w_r": _w(self._w_r),
+            "w_d": _w(self._w_d),
+            # Counters and flags
+            "ts": self.ts,
+            "last_shift_step": self.last_shift_step,
+            "detections": list(self.detections),
+            "last_pval": self.last_pval,
+            "last_score": self.last_score,
+            "last_err_r": self.last_err_r,
+            "last_err_d": self.last_err_d,
+            "last_fire_info": dict(self.last_fire_info),
+            "_warmup_reset_done": self._warmup_reset_done,
+            "rng": self.rng.__getstate__(),
+        }
+
+    def load_state_dict(self, sd: dict) -> None:
+        """Restore mutable state from a previously saved state_dict."""
+        self.net.load_state_dict(sd["net"])
+        self.opt.load_state_dict(sd["opt"])
+
+        self._replay = deque(sd["replay"], maxlen=self._replay.maxlen)
+        self._scores = deque(sd["scores"], maxlen=self._scores.maxlen)
+
+        def _restore_w(d):
+            w = Welford()
+            w.n, w.mean, w.M2 = d["n"], d["mean"], d["M2"]
+            return w
+
+        self._w_r = _restore_w(sd["w_r"])
+        self._w_d = _restore_w(sd["w_d"])
+
+        self.ts = sd["ts"]
+        self.last_shift_step = sd["last_shift_step"]
+        self.detections = list(sd["detections"])
+        self.last_pval = sd["last_pval"]
+        self.last_score = sd["last_score"]
+        self.last_err_r = sd["last_err_r"]
+        self.last_err_d = sd["last_err_d"]
+        self.last_fire_info = dict(sd["last_fire_info"])
+        self._warmup_reset_done = sd["_warmup_reset_done"]
+        self.rng.__setstate__(sd["rng"])
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
     def _one_hot(self, a):

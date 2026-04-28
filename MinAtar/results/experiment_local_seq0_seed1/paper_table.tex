@@ -1,0 +1,15 @@
+\begin{table}[t]
+\centering
+\caption{FAME + TSDM on MinAtar. Avg.~Perf (proxy from training trace), Avg.~Perf (post-hoc rollouts), Forward Transfer (vs.~Oracle AUC baseline), Forgetting (cross-method-std-normalised), and detection quality. Mean $\pm$ standard error across seeds.}
+\label{tab:fame-tsdm}
+\begin{tabular}{lrrrrrrrr}
+\toprule
+Method & $n$ & AvgPerf$_{\text{proxy}}\uparrow$ & AvgPerf$_{\text{posthoc}}\uparrow$ & FT$\uparrow$ & Forgetting$\downarrow$ & Det.\ F1$\uparrow$ & Det.\ delay$\downarrow$ & TP/FP/FN \\
+\midrule
+oracle & 1 & 11.94 $\pm$ 0.00 & - & 0.000 $\pm$ 0.000 & +1.260 & - & - & - \\
+swoks & 1 & 9.17 $\pm$ 0.00 & - & -0.865 $\pm$ 0.000 & +2.136 & 0.91 $\pm$ 0.00 & 4983 $\pm$ 0 & 5/0/1 \\
+implicit & 1 & 5.02 $\pm$ 0.00 & - & -0.997 $\pm$ 0.000 & +2.814 & 0.12 $\pm$ 0.00 & 20939 $\pm$ 0 & 4/56/2 \\
+hybrid & 1 & 5.50 $\pm$ 0.00 & - & -1.148 $\pm$ 0.000 & +2.787 & 0.22 $\pm$ 0.00 & 13010 $\pm$ 0 & 4/26/2 \\
+\bottomrule
+\end{tabular}
+\end{table}

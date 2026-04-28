@@ -502,6 +502,22 @@ def _has_mpl() -> bool:
     return _HAS_MPL
 
 
+def _thin(arr: np.ndarray, max_pts: int = 4000) -> np.ndarray:
+    """Stride-downsample *arr* to at most *max_pts* points.
+
+    The AGG renderer raises OverflowError: Exceeded cell block limit when asked
+    to render more than ~1M path segments.  With 3.5M training steps per run,
+    learning-curve arrays must be thinned before plotting.  A stride of
+    ceil(N/max_pts) preserves the visual shape of a heavily smoothed curve
+    while keeping the point count well inside the renderer's limit.
+    """
+    n = len(arr)
+    if n <= max_pts:
+        return arr
+    step = math.ceil(n / max_pts)
+    return arr[::step]
+
+
 def plot_learning_curves(summaries_by_mode: Dict[str, List[RunSummary]],
                          out_path: str,
                          smooth_window: int = 3000) -> None:
@@ -520,9 +536,12 @@ def plot_learning_curves(summaries_by_mode: Dict[str, List[RunSummary]],
         ])
         mu = stack.mean(axis=0)
         se = stack.std(axis=0, ddof=0) / math.sqrt(stack.shape[0])
-        xs = np.arange(L)
-        ax.plot(xs, mu, label=mode, linewidth=1.4)
-        ax.fill_between(xs, mu - se, mu + se, alpha=0.15)
+        # Downsample before plotting: 3.5M points triggers AGG cell-block overflow.
+        xs = _thin(np.arange(L))
+        mu_plot = _thin(mu)
+        se_plot = _thin(se)
+        ax.plot(xs, mu_plot, label=mode, linewidth=1.4)
+        ax.fill_between(xs, mu_plot - se_plot, mu_plot + se_plot, alpha=0.15)
     # Oracle vertical lines -- pick first run that has them.
     for runs in summaries_by_mode.values():
         if runs:

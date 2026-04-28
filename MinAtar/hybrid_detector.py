@@ -320,5 +320,52 @@ class HybridDetector:
             "inner_stat": self.stat.stats(),
         }
 
+    # ------------------------------------------------------------------
+    # Serialisation -- used by FAME.py mid-training checkpointing
+    # ------------------------------------------------------------------
+    def state_dict(self) -> dict:
+        """Return a picklable snapshot of all mutable detector state,
+        including the full state of both inner detectors."""
+        return {
+            # FSM state
+            "state": self.state,
+            "ts": self.ts,
+            "last_fire_ts": self.last_fire_ts,
+            "suspect_entered_at": self.suspect_entered_at,
+            "_loose_streak": self._loose_streak,
+            "_strict_streak": self._strict_streak,
+            # Bookkeeping
+            "detections": list(self.detections),
+            "events": list(self.events),
+            "snapshot_requested": self.snapshot_requested,
+            "last_p_imp": self.last_p_imp,
+            "last_p_stat": self.last_p_stat,
+            "last_combined": self.last_combined,
+            "last_reason": self.last_reason,
+            # Inner detector full state
+            "imp": self.imp.state_dict(),
+            "stat": self.stat.state_dict(),
+        }
+
+    def load_state_dict(self, sd: dict) -> None:
+        """Restore full hybrid + inner detector state from state_dict."""
+        self.state = sd["state"]
+        self.ts = sd["ts"]
+        self.last_fire_ts = sd["last_fire_ts"]
+        self.suspect_entered_at = sd["suspect_entered_at"]
+        self._loose_streak = sd["_loose_streak"]
+        self._strict_streak = sd["_strict_streak"]
+
+        self.detections = list(sd["detections"])
+        self.events = list(sd["events"])
+        self.snapshot_requested = sd["snapshot_requested"]
+        self.last_p_imp = sd["last_p_imp"]
+        self.last_p_stat = sd["last_p_stat"]
+        self.last_combined = sd["last_combined"]
+        self.last_reason = sd["last_reason"]
+
+        self.imp.load_state_dict(sd["imp"])
+        self.stat.load_state_dict(sd["stat"])
+
 
 __all__ = ["HybridDetector"]

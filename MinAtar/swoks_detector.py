@@ -234,6 +234,35 @@ class SwoksDetector:
         }
 
     # ------------------------------------------------------------------
+    # Serialisation -- used by FAME.py mid-training checkpointing
+    # ------------------------------------------------------------------
+    def state_dict(self) -> dict:
+        """Return a picklable snapshot of all mutable detector state."""
+        return {
+            "buffer": list(self._buffer),          # list[np.ndarray]
+            "swd_hist": list(self._swd_hist),       # list[float]
+            "ts": self.ts,
+            "last_shift_step": self.last_shift_step,
+            "detections": list(self.detections),
+            "last_pval": self.last_pval,
+            "last_swd": self.last_swd,
+            "last_fire_info": dict(self.last_fire_info),
+            "rng": self.rng.__getstate__(),
+        }
+
+    def load_state_dict(self, sd: dict) -> None:
+        """Restore mutable state from a previously saved state_dict."""
+        self._buffer = deque(sd["buffer"], maxlen=self._buffer.maxlen)
+        self._swd_hist = deque(sd["swd_hist"], maxlen=self._swd_hist.maxlen)
+        self.ts = sd["ts"]
+        self.last_shift_step = sd["last_shift_step"]
+        self.detections = list(sd["detections"])
+        self.last_pval = sd["last_pval"]
+        self.last_swd = sd["last_swd"]
+        self.last_fire_info = dict(sd["last_fire_info"])
+        self.rng.__setstate__(sd["rng"])
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
     def _make_feature(self, phi, action, reward):

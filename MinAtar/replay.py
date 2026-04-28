@@ -8,6 +8,7 @@ class expReplay():
 		self.memory = deque(maxlen=max_size)
 		self.batch_size = batch_size
 		self.device = device
+		self._max_size = max_size
 
 	def store(self, obs, action, next_obs, reward, done):
 		state = np.moveaxis(obs, 2, 0)
@@ -34,7 +35,15 @@ class expReplay():
 	def delete(self):
 		self.memory.clear()
 
+	# --- checkpoint helpers ---
+	def state_dict(self) -> dict:
+		"""Return contents as a list of CPU tensors (picklable)."""
+		return {"memory": [tuple(t.cpu() for t in item) for item in self.memory],
+				"max_size": self._max_size}
 
+	def load_state_dict(self, sd: dict) -> None:
+		self._max_size = sd.get("max_size", self._max_size)
+		self.memory = deque(sd["memory"], maxlen=self._max_size)
 
 
 class expReplay_Meta():
@@ -42,6 +51,7 @@ class expReplay_Meta():
 		self.memory = deque(maxlen=max_size)
 		self.batch_size = batch_size
 		self.device = device
+		self._max_size = max_size
 
 	# [state, acton]
 	def store(self, obs, action):
@@ -71,6 +81,16 @@ class expReplay_Meta():
 		for item in self.memory: # (state, action)
 			target_buffer.memory.append(item)
 		return target_buffer
+
+	# --- checkpoint helpers ---
+	def state_dict(self) -> dict:
+		"""Return contents as a list of CPU tensors (picklable)."""
+		return {"memory": [tuple(t.cpu() for t in item) for item in self.memory],
+				"max_size": self._max_size}
+
+	def load_state_dict(self, sd: dict) -> None:
+		self._max_size = sd.get("max_size", self._max_size)
+		self.memory = deque(sd["memory"], maxlen=self._max_size)
 
 class expReplay_PM():
 	def __init__(self, max_size, batch_size, device):
