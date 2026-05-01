@@ -1,26 +1,4 @@
-"""Compare FAME runs across detector variants (oracle / swoks / implicit / hybrid).
 
-Reads `results/FAME_{mode}_*.pkl` files produced by FAME.py and reports the
-detection-quality + continual-RL metrics required by the proposal's
-evaluation section.
-
-Metrics produced (per seed and aggregated, for each detector mode):
-  * Detection: TP, FP, FN, precision, recall, F1, mean/max delay
-  * Per-task forward transfer (FT), forgetting (F), average performance
-    computed on the returns trace (MinAtar style)
-  * Relative performance vs. the oracle ceiling
-  * CSV dump: one row per (detector, seed)
-
-Legacy name kept for backwards compatibility; in spirit this is
-``compare_detectors.py``.
-
-Usage:
-  python compare_oracle_vs_swoks.py \
-       --results_dir results \
-       --seeds 1 2 3 \
-       --seq 0 \
-       --tolerance 60000
-"""
 
 import argparse
 import glob

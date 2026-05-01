@@ -1,34 +1,6 @@
-#!/bin/bash
-# run_analysis_local.sh -- Run the full experiment.py analysis locally.
-#
-# Drop your four pkl files into RESULTS_DIR (default: results/) then run:
-#
-#   bash run_analysis_local.sh
-#
-# Expected pkl names (seq=0, seed=1, full paper schedule):
-#   FAME_oracle_steps_3500000_switch_500000_seq_0_warmstep_50000_lambda_1.0_seed_1_returns.pkl
-#   FAME_swoks_steps_3500000_switch_500000_seq_0_warmstep_50000_lambda_1.0_seed_1_returns.pkl
-#   FAME_implicit_steps_3500000_switch_500000_seq_0_warmstep_50000_lambda_1.0_seed_1_returns.pkl
-#   FAME_hybrid_steps_3500000_switch_500000_seq_0_warmstep_50000_lambda_1.0_seed_1_returns.pkl
-#
-# Env-var overrides (all optional):
-#   RESULTS_DIR   path that contains the four pkl files  (default: results)
-#   MODELS_DIR    path with MetaFinal.pt weights         (default: models)
-#   SEQ           sequence id used during training       (default: 0)
-#   SEED          seed used during training              (default: 1)
-#   TSTEPS        total steps used during training       (default: 3500000)
-#   SWITCH        steps-per-task used during training    (default: 500000)
-#   WARMSTEP      warmstep used during training          (default: 50000)
-#   LAMBDA        lambda_reg used during training        (default: 1.0)
-#   SKIP_POSTHOC  set to 1 to skip post-hoc rollouts    (default: 1)
-#   PY            python binary                          (default: ../FAMEenv/bin/python)
-
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
 PY="${PY:-../FAMEenv/bin/python}"
 
 RESULTS_DIR="${RESULTS_DIR:-results}"
@@ -38,31 +10,24 @@ LOGS_DIR="${LOGS_DIR:-logs}"
 SEQ="${SEQ:-0}"
 SEED="${SEED:-1}"
 
-# Must match the values used when training (they appear in the pkl filename).
 TSTEPS="${TSTEPS:-3500000}"
 SWITCH="${SWITCH:-500000}"
 WARMSTEP="${WARMSTEP:-50000}"
 LAMBDA="${LAMBDA:-1.0}"
 
-# Post-hoc rollouts require MetaFinal.pt files saved by FAME.py --save-model.
-# Default is off because Kaggle pkl-only exports usually don't include them.
+
 SKIP_POSTHOC="${SKIP_POSTHOC:-1}"
 POSTHOC_EPS="${POSTHOC_EPS:-30}"
 POSTHOC_STEPS="${POSTHOC_STEPS:-3000}"
 
 mkdir -p "$LOGS_DIR"
 
-# ---------------------------------------------------------------------------
-# Helper: expected pkl path for a given detector
-# ---------------------------------------------------------------------------
 expected_pkl() {
     local det="$1"
     echo "${RESULTS_DIR}/FAME_${det}_steps_${TSTEPS}_switch_${SWITCH}_seq_${SEQ}_warmstep_${WARMSTEP}_lambda_${LAMBDA}_seed_${SEED}_returns.pkl"
 }
 
-# ---------------------------------------------------------------------------
-# Pre-flight: all four pkl files must exist
-# ---------------------------------------------------------------------------
+
 echo "==================================================================="
 echo " FAME + TSDM local analysis"
 echo "   seq=${SEQ}  seed=${SEED}  steps=${TSTEPS}  switch=${SWITCH}"
@@ -95,9 +60,7 @@ echo
 echo "All pkl files found -- running experiment.py ..."
 echo
 
-# ---------------------------------------------------------------------------
-# Build experiment.py argument list
-# ---------------------------------------------------------------------------
+
 ANALYSIS_ARGS=(
     --results_dir "$RESULTS_DIR"
     --models_dir  "$MODELS_DIR"
@@ -124,15 +87,10 @@ fi
 
 echo
 
-# ---------------------------------------------------------------------------
-# Run
-# ---------------------------------------------------------------------------
 "$PY" experiment.py "${ANALYSIS_ARGS[@]}" \
     2>&1 | tee "$LOGS_DIR/analysis_local_seq${SEQ}_seed${SEED}.log"
 
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
+
 OUT_DIR="${RESULTS_DIR}/experiment_local_seq${SEQ}_seed${SEED}"
 echo
 echo "==================================================================="

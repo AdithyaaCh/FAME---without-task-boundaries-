@@ -1,58 +1,3 @@
-"""Pre-run parameter heuristics for the TSDM family (SWOKS / implicit / hybrid).
-
-Two entry points are exposed:
-
-    suggest_params(switch_steps, mini=False)
-        Lightweight, backwards-compatible API used by FAME.py --auto_params.
-        Only needs the expected task length; returns a DetectorParams object.
-
-    suggest_params_full(**ctx)
-        Richer API used by experiment.py: also consumes the TOTAL budget
-        (num_tasks * switch_steps), the action space size and the latent-
-        feature dimension.  Produces parameters that are scaled with the
-        full-run multiple-testing burden (Bonferroni-style alpha), and with
-        the representational capacity requirements of the implicit TSN.
-
-Design principles (shared by both APIs)
----------------------------------------
-
-1. **Windows scale sub-linearly with the task.**
-   A task of 500k steps needs a larger detection window than a 5k-step task,
-   but the ratio shouldn't be constant: very short tasks have so little data
-   that we must still preserve >= ~100 post-shift samples for the statistic
-   to have any power.  `L_D = clamp(switch/40, 100, 1500)`.
-
-2. **Detection interval = O(L_D / 5).**
-   Running the test too often wastes compute and tightens the multiple-
-   testing correction; too rarely and detection latency grows.  `L_D / 5`
-   gives ~5 overlapping tests per window.
-
-3. **Stable phase = ~ task_length / 15.**
-   After firing, wait long enough for the reference window to fill with
-   post-shift data, but not so long that short back-to-back shifts are lost.
-
-4. **Warmup >= 3 * L_D.**
-   Features / TSN must settle before their errors carry signal.
-
-5. **Alpha is family-wise-corrected.**
-   If the detector performs ~N tests over a full run, pick alpha such that
-   the expected false-positive count is bounded.  For the paper's 3.5M-step
-   MinAtar protocol with detection_interval=240, N ~ 14,500 -- a target of
-   expected FP = 1 implies alpha ~ 7e-5.  We cap at 1e-3 to stay sensitive.
-
-6. **Hybrid combined threshold = -log(alpha_imp) - log(alpha_stat).**
-   Setting tau_combined equal to the sum of single-detector log-thresholds
-   makes the combined-nats gate statistically equivalent to "both detectors
-   at their own alpha" under independence, but realised as a SUM of log-
-   p-values so one strong signal can compensate for a weaker co-signal.
-
-7. **Implicit update cadence scales with replay churn.**
-   Target ~1 TSN gradient step per batch-size's worth of fresh transitions.
-
-These rules are *suggestions*, not hard requirements -- they are what
-FAME.py --auto_params dials in if the user hasn't overridden detector flags.
-"""
-
 from __future__ import annotations
 
 import math
@@ -60,9 +5,8 @@ from dataclasses import asdict, dataclass, field
 from typing import Dict, Optional
 
 
-# ----------------------------------------------------------------------
+
 # Container
-# ----------------------------------------------------------------------
 @dataclass
 class DetectorParams:
     # Shared across SWOKS / implicit / hybrid
@@ -97,9 +41,6 @@ class DetectorParams:
         return asdict(self)
 
 
-# ----------------------------------------------------------------------
-# Public helpers
-# ----------------------------------------------------------------------
 def fp_corrected_alpha(num_tests: int,
                        target_expected_fp: float = 1.0,
                        cap: float = 1e-3,
@@ -130,9 +71,6 @@ def combined_nats_from(alpha_imp: float, alpha_stat: float,
             + safety)
 
 
-# ----------------------------------------------------------------------
-# Legacy light API (kept so existing --auto_params path still works)
-# ----------------------------------------------------------------------
 def suggest_params(switch_steps: int, *, mini: bool = False) -> DetectorParams:
     """Legacy API: task-horizon-only heuristic."""
     total = switch_steps * 7  # assume 7-task MinAtar unless caller knows better
@@ -145,9 +83,6 @@ def suggest_params(switch_steps: int, *, mini: bool = False) -> DetectorParams:
     )
 
 
-# ----------------------------------------------------------------------
-# Richer API
-# ----------------------------------------------------------------------
 def suggest_params_full(
     *,
     switch_steps: int,
@@ -157,32 +92,10 @@ def suggest_params_full(
     target_expected_fp: float = 1.0,
     mini: bool = False,
 ) -> DetectorParams:
-    """Return heuristic parameters scaled to run size + network size.
-
-    Parameters
-    ----------
-    switch_steps : int
-        Expected number of steps between task switches (args.switch).
-    total_steps : int, optional
-        Expected total number of training steps across the whole sequence.
-        Drives the Bonferroni-style alpha correction.  Defaults to
-        7 * switch_steps (paper's K=7 protocol).
-    num_actions : int
-        Action space cardinality (only used to right-size the implicit TSN
-        batch size: larger action sets need more per-step samples).
-    latent_dim : int
-        Dimensionality of the policy's penultimate feature.  Larger latents
-        benefit from a slightly larger batch size.
-    target_expected_fp : float
-        Target expected number of false positives over the whole run.
-        Default 1.0 (at most one spurious detection per training run).
-    mini : bool
-        If True, loosen alpha to 5e-2 and beta to 1.2 for short runs.
-    """
     if total_steps is None:
         total_steps = max(switch_steps * 7, switch_steps)
 
-    # -------- Windows ------------------------------------------------
+    # Windows 
     L_D = max(100, min(int(switch_steps) // 40, 1500))
     # L_W chosen so the reference window reaches ~L_W*L_D into the past --
     # this must be smaller than switch_steps so the reference can actually
@@ -207,7 +120,7 @@ def suggest_params_full(
 
     beta = 1.2 if mini else 2.0
 
-    # -------- Implicit detector sizing ------------------------------
+    #  Implicit detector sizing 
     imp_lr = 1e-4
     # Replay must comfortably hold at least two full windows so that we can
     # train on fresh data without immediately forgetting the last regime.
@@ -221,7 +134,7 @@ def suggest_params_full(
     # we keep it in a ballpark small enough that the TSN stays dirt cheap.
     imp_hidden = int(max(64, min(128, 32 + latent_dim // 4 + num_actions)))
 
-    # -------- Hybrid thresholds -------------------------------------
+    # Hybrid thresholds 
     # Loose entry: a single-tailed 5% quantile in mini runs, 1% in full runs.
     hyb_tau_imp_loose = 5e-2 if mini else 1e-2
     # Strict bypasses = standalone single-detector alphas.
@@ -271,9 +184,8 @@ def format_suggestion(params: DetectorParams, switch_steps: int) -> str:
     return "\n".join(lines)
 
 
-# ----------------------------------------------------------------------
+
 # CLI sanity
-# ----------------------------------------------------------------------
 if __name__ == "__main__":
     import sys
     for s in (4000, 8000, 32000, 500000, 3500000):

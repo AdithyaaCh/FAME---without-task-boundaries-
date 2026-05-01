@@ -1,5 +1,0 @@
-mode,seed,seq,n_steps,avg_perf_proxy,mean_auc,mean_ft,forgetting_proxy,forgetting_normalised,tp,fp,fn,precision,recall,f1,mean_delay,max_delay,num_oracle,num_detected,posthoc_avg_perf
-oracle,1,0,9000,1.3544,0.5194,0.0000,-0.1148,0.0000,2,0,0,1.000,1.000,1.000,225.0,300,2,2,
-swoks,1,0,12000,0.9332,0.5002,-0.0455,0.0033,0.0000,2,0,0,1.000,1.000,1.000,599.0,699,2,2,
-implicit,1,0,32000,1.5423,0.4518,-0.1653,-0.3400,-1.7360,1,10,2,0.091,0.333,0.143,1449.0,1449,3,11,
-hybrid,1,0,32000,0.7608,0.4911,-0.0283,-0.3135,-0.9449,2,3,1,0.400,0.667,0.500,274.5,350,3,5,

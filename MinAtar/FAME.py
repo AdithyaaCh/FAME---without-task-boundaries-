@@ -1,23 +1,5 @@
-"""FAME for MinAtar, with optional boundary-free task-shift detection.
-
-Detection modes (selected by `--detector`):
-  * oracle   -- original FAME: fires at every `--switch` step (ceiling).
-  * swoks    -- Approach 1: statistical SWD+KS on latent action-reward.
-  * implicit -- Approach 2: dual-head Task-Signature Network (reward +
-                forward-dynamics prediction errors) with Welch's t-test.
-  * hybrid   -- Approach 3: 3-state cascade + log-evidence fusion of
-                implicit (fast, reactive) and swoks (slow, reliable).
-
-In all non-oracle modes the environment still switches every `--switch` steps
-so we retain ground truth for post-hoc detection metrics, but the agent only
-reacts when its detector fires.  Results are pickled to
-`results/FAME_{mode}_...pkl` and consumed by `compare_oracle_vs_swoks.py`.
-
-Legacy: `--use_swoks 0/1` is still accepted as an alias for
-`--detector oracle` / `--detector swoks`.
-"""
-
 import copy
+import glob
 import os
 import pickle
 import random
@@ -110,6 +92,10 @@ def build_parser():
     p.add_argument('--imp_replay', type=int, default=0,
                    help="0 -> 4*imp_L_D")
     p.add_argument('--imp_update_every', type=int, default=16)
+    p.add_argument('--imp_score_batch_size', type=int, default=0,
+                   help="Transitions to accumulate before one batched TSN "
+                        "forward pass for error scoring.  0 -> same as "
+                        "--imp_update_every (recommended).")
     p.add_argument('--imp_max_wait', type=int, default=0)
 
     # --- Hybrid-specific ---
@@ -124,158 +110,15 @@ def build_parser():
     p.add_argument('--results_dir', type=str, default="results")
     p.add_argument('--models_dir', type=str, default="models")
 
-    # --- Mid-training checkpoint/resume (for Kaggle timeout recovery) ---
-    p.add_argument('--checkpoint_every', type=int, default=0,
-                   help="Save a mid-training checkpoint every N steps.  "
-                        "0 disables.  Recommended: 50000 on Kaggle.")
-    p.add_argument('--checkpoint_dir', type=str, default="checkpoints",
-                   help="Directory for mid-training checkpoint files.")
+    # --- Checkpointing ---
+    p.add_argument('--checkpoint_dir', type=str, default=None,
+                   help="Directory to save/load training checkpoints. "
+                        "If None, checkpointing is disabled.")
+    p.add_argument('--checkpoint_interval', type=int, default=100000,
+                   help="Save a checkpoint every this many training steps "
+                        "(default: 100 000).")
 
     return p
-
-
-# ----------------------------------------------------------------------
-# Mid-training checkpoint helpers
-# ----------------------------------------------------------------------
-
-def _ckpt_path(checkpoint_dir: str, filename: str) -> str:
-    """Canonical path for a run's mid-training checkpoint file."""
-    return os.path.join(checkpoint_dir, f"{filename}_ckpt.pkl")
-
-
-def save_checkpoint(path: str, step: int, gameid: int, games: list,
-                    returns_array, oracle_boundaries: list,
-                    detected_boundaries: list, detection_log: list,
-                    flag_history: list, avg_return: float,
-                    epi_return: float, meta_warmup: int,
-                    Fast_Learner, Fast_opt,
-                    Meta_Learner, Meta_opt,
-                    Target_net,
-                    snapshots: list,
-                    detector,
-                    exp_replay_fast, exp_replay_fast2meta,
-                    exp_replay_meta) -> None:
-    """Atomically write a mid-training checkpoint.
-
-    All model state dicts are saved on CPU so the file is portable
-    across GPU IDs and can be loaded even if no GPU is available on
-    resume.  Replay buffers are included so fast-learner training
-    resumes without a cold-start period.
-
-    The write is atomic: we write to a .tmp file first and then rename,
-    so a kernel kill mid-write never leaves a corrupt checkpoint.
-    """
-    ckpt = {
-        # Loop bookkeeping
-        "step": step,
-        "gameid": gameid,
-        "games": list(games),
-        "returns_array": returns_array.copy(),
-        "oracle_boundaries": list(oracle_boundaries),
-        "detected_boundaries": list(detected_boundaries),
-        "detection_log": list(detection_log),
-        "flag_history": list(flag_history),
-        "avg_return": avg_return,
-        "epi_return": epi_return,
-        "meta_warmup": meta_warmup,
-        # Networks (CPU copies)
-        "Fast_Learner": {k: v.cpu() for k, v in
-                         Fast_Learner.state_dict().items()},
-        "Fast_opt": Fast_opt.state_dict(),
-        "Meta_Learner": {k: v.cpu() for k, v in
-                         Meta_Learner.state_dict().items()},
-        "Meta_opt": Meta_opt.state_dict(),
-        "Target_net": {k: v.cpu() for k, v in
-                       Target_net.state_dict().items()},
-        # Snapshot ring: list of (step, cpu-state-dict) pairs
-        "snapshots": [(s, {k: v.cpu() for k, v in sd.items()})
-                      for s, sd in snapshots],
-        # Detector (None for oracle)
-        "detector": (detector.core.state_dict()
-                     if detector is not None and
-                     hasattr(detector.core, "state_dict") else None),
-        # Replay buffers
-        "exp_replay_fast": exp_replay_fast.state_dict(),
-        "exp_replay_fast2meta": exp_replay_fast2meta.state_dict(),
-        "exp_replay_meta": exp_replay_meta.state_dict(),
-        # RNG states for exact reproducibility
-        "rng_torch": torch.get_rng_state(),
-        "rng_numpy": np.random.get_state(),
-        "rng_python": random.getstate(),
-    }
-    tmp = path + ".tmp"
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(tmp, "wb") as f:
-        pickle.dump(ckpt, f, protocol=4)
-    os.replace(tmp, path)
-    print(f"[ckpt] saved @ step {step} -> {path}")
-
-
-def load_checkpoint(path: str, device,
-                    Fast_Learner, Fast_opt,
-                    Meta_Learner, Meta_opt,
-                    Target_net,
-                    snapshots: list,
-                    detector,
-                    exp_replay_fast, exp_replay_fast2meta,
-                    exp_replay_meta) -> dict:
-    """Load a mid-training checkpoint and restore all mutable state in-place.
-
-    Returns a dict of scalar bookkeeping values that the caller must
-    assign back into its local variables:
-        step, gameid, games, returns_array, oracle_boundaries,
-        detected_boundaries, detection_log, flag_history,
-        avg_return, epi_return, meta_warmup
-    """
-    with open(path, "rb") as f:
-        ckpt = pickle.load(f)
-
-    # Networks
-    Fast_Learner.load_state_dict(
-        {k: v.to(device) for k, v in ckpt["Fast_Learner"].items()})
-    Fast_opt.load_state_dict(ckpt["Fast_opt"])
-    Meta_Learner.load_state_dict(
-        {k: v.to(device) for k, v in ckpt["Meta_Learner"].items()})
-    Meta_opt.load_state_dict(ckpt["Meta_opt"])
-    Target_net.load_state_dict(
-        {k: v.to(device) for k, v in ckpt["Target_net"].items()})
-
-    # Snapshot ring
-    snapshots.clear()
-    snapshots.extend(
-        (s, {k: v.to(device) for k, v in sd.items()})
-        for s, sd in ckpt["snapshots"]
-    )
-
-    # Detector
-    if detector is not None and ckpt.get("detector") is not None:
-        if hasattr(detector.core, "load_state_dict"):
-            detector.core.load_state_dict(ckpt["detector"])
-
-    # Replay buffers
-    exp_replay_fast.load_state_dict(ckpt["exp_replay_fast"])
-    exp_replay_fast2meta.load_state_dict(ckpt["exp_replay_fast2meta"])
-    exp_replay_meta.load_state_dict(ckpt["exp_replay_meta"])
-
-    # RNG states
-    torch.set_rng_state(ckpt["rng_torch"])
-    np.random.set_state(ckpt["rng_numpy"])
-    random.setstate(ckpt["rng_python"])
-
-    print(f"[ckpt] resumed from step {ckpt['step']} <- {path}")
-    return {
-        "step": ckpt["step"],
-        "gameid": ckpt["gameid"],
-        "games": list(ckpt["games"]),
-        "returns_array": ckpt["returns_array"].copy(),
-        "oracle_boundaries": list(ckpt["oracle_boundaries"]),
-        "detected_boundaries": list(ckpt["detected_boundaries"]),
-        "detection_log": list(ckpt["detection_log"]),
-        "flag_history": list(ckpt["flag_history"]),
-        "avg_return": ckpt["avg_return"],
-        "epi_return": ckpt["epi_return"],
-        "meta_warmup": ckpt["meta_warmup"],
-    }
 
 
 # ----------------------------------------------------------------------
@@ -325,6 +168,8 @@ def build_detector(kind, args, latent_dim, num_actions, device, on_suspect):
             seed=args.seed,
         ))
     if kind == "implicit":
+        _score_bs = args.imp_score_batch_size if args.imp_score_batch_size > 0 \
+            else None  # None -> ImplicitDetector defaults to update_every
         return DetectorAdapter("implicit", ImplicitDetector(
             latent_dim=latent_dim, num_actions=num_actions,
             L_D=args.imp_L_D, alpha=args.imp_alpha,
@@ -336,6 +181,7 @@ def build_detector(kind, args, latent_dim, num_actions, device, on_suspect):
             replay_capacity=(args.imp_replay if args.imp_replay > 0
                              else None),
             update_every=args.imp_update_every,
+            score_batch_size=_score_bs,
             device=str(device), seed=args.seed,
         ))
     if kind == "hybrid":
@@ -344,6 +190,8 @@ def build_detector(kind, args, latent_dim, num_actions, device, on_suspect):
         # their live `last_pval` to make firing decisions.  If the
         # inner auto-fired, it would reset its cached p-value and the
         # hybrid would lose the signal.
+        _score_bs = args.imp_score_batch_size if args.imp_score_batch_size > 0 \
+            else None
         imp = ImplicitDetector(
             latent_dim=latent_dim, num_actions=num_actions,
             L_D=args.imp_L_D, alpha=0.0,
@@ -355,6 +203,7 @@ def build_detector(kind, args, latent_dim, num_actions, device, on_suspect):
             replay_capacity=(args.imp_replay if args.imp_replay > 0
                              else None),
             update_every=args.imp_update_every,
+            score_batch_size=_score_bs,
             device=str(device), seed=args.seed,
         )
         swk = SwoksDetector(
@@ -626,9 +475,97 @@ class FameBoundaryTrigger:
         }
 
 
-# ----------------------------------------------------------------------
-# Main
-# ----------------------------------------------------------------------
+def _checkpoint_path(checkpoint_dir: str, filename: str) -> str:
+    """Return the path for the latest checkpoint file for this run."""
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    return os.path.join(checkpoint_dir, f"{filename}_checkpoint.pkl")
+
+
+def save_checkpoint(
+    path: str,
+    *,
+    step: int,
+    gameid: int,
+    avg_return: float,
+    epi_return: float,
+    meta_warmup: int,
+    returns_array,
+    oracle_boundaries,
+    detected_boundaries,
+    detection_log,
+    flag_history,
+    Games,
+    snapshots,
+    Fast_Learner,
+    Fast_opt,
+    Target_net,
+    Meta_Learner,
+    Meta_opt,
+    Meta_scheduler,
+    exp_replay_fast,
+    exp_replay_fast2meta,
+    exp_replay_meta,
+    detector,
+    elapsed_time_so_far: float,
+) -> None:
+    """Persist all training state needed to resume from *step*."""
+    tmp_path = path + ".tmp"
+    blob = {
+        "step": step,
+        "gameid": gameid,
+        "avg_return": avg_return,
+        "epi_return": epi_return,
+        "meta_warmup": meta_warmup,
+        "returns_array": returns_array,
+        "oracle_boundaries": list(oracle_boundaries),
+        "detected_boundaries": list(detected_boundaries),
+        "detection_log": list(detection_log),
+        "flag_history": list(flag_history),
+        "Games": list(Games),
+        "snapshots": [(s, sd) for s, sd in snapshots],
+        # Neural-network weights + optimiser states
+        "Fast_Learner_sd": Fast_Learner.state_dict(),
+        "Fast_opt_sd": Fast_opt.state_dict(),
+        "Target_net_sd": Target_net.state_dict(),
+        "Meta_Learner_sd": Meta_Learner.state_dict(),
+        "Meta_opt_sd": Meta_opt.state_dict(),
+        "Meta_scheduler_sd": Meta_scheduler.state_dict(),
+        # Replay buffers stored as raw deque contents
+        "exp_replay_fast_mem": list(exp_replay_fast.memory),
+        "exp_replay_fast2meta_mem": list(exp_replay_fast2meta.memory),
+        "exp_replay_meta_mem": list(exp_replay_meta.memory),
+        # Detector internal state (optional -- may not be serialisable for
+        # all detector types; we catch exceptions and warn gracefully).
+        "detector_state": None,
+        # Accumulated wall-clock time from all previous sessions.
+        "elapsed_time_so_far": elapsed_time_so_far,
+    }
+    # Attempt to serialise the detector's own state.
+    if detector is not None:
+        try:
+            import io
+            buf = io.BytesIO()
+            pickle.dump(detector.core, buf)
+            blob["detector_state"] = buf.getvalue()
+        except Exception as exc:
+            print(f"[checkpoint] warning: could not serialise detector state: {exc}")
+    with open(tmp_path, "wb") as f:
+        pickle.dump(blob, f)
+    os.replace(tmp_path, path)  # atomic on POSIX
+    print(f"[checkpoint] saved -> {path}  (step={step})")
+
+
+def load_latest_checkpoint(checkpoint_dir: str, filename: str):
+    """Return the checkpoint dict if one exists, else None."""
+    path = _checkpoint_path(checkpoint_dir, filename)
+    if not os.path.exists(path):
+        return None, None
+    print(f"[checkpoint] loading -> {path}")
+    with open(path, "rb") as f:
+        blob = pickle.load(f)
+    return blob, path
+
+
 def main():
     args = build_parser().parse_args()
 
@@ -650,6 +587,9 @@ def main():
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     print("device =", device)
+
+    # Track wall-clock time; this accumulates across resumed sessions.
+    _session_start_time = time.time()
 
     detector_kind = resolve_detector_kind(args)
     mode_tag = detector_kind
@@ -698,7 +638,16 @@ def main():
     print(f"Run: {filename}")
     print(args)
 
-    # --- Initial env ---
+    # ------------------------------------------------------------------
+    # Try to resume from an existing checkpoint
+    # ------------------------------------------------------------------
+    _checkpoint_blob = None
+    if args.checkpoint_dir:
+        _checkpoint_blob, _ckpt_path = load_latest_checkpoint(
+            args.checkpoint_dir, filename
+        )
+
+    # --- Initial env (always needed for shapes even during resume) ---
     gameid = 0
     env = CL_envs_func_replacement(seq=args.seq, game_id=gameid,
                                    seed=args.seed)
@@ -784,57 +733,74 @@ def main():
     epi_return = 0.0
     meta_warmup = 0
     step = 0
+    _elapsed_time_prev_sessions = 0.0  # seconds accumulated before this session
+
+    # ------------------------------------------------------------------
+    # Restore checkpoint (if one was found)
+    # ------------------------------------------------------------------
+    if _checkpoint_blob is not None:
+        ck = _checkpoint_blob
+        step = ck["step"]
+        gameid = ck["gameid"]
+        avg_return = ck["avg_return"]
+        epi_return = ck["epi_return"]
+        meta_warmup = ck["meta_warmup"]
+        returns_array = ck["returns_array"]
+        oracle_boundaries = ck["oracle_boundaries"]
+        detected_boundaries = ck["detected_boundaries"]
+        detection_log = ck["detection_log"]
+        flag_history = ck["flag_history"]
+        Games = ck["Games"]
+        snapshots[:] = ck["snapshots"]
+        _elapsed_time_prev_sessions = ck.get("elapsed_time_so_far", 0.0)
+
+        # Restore network weights
+        Fast_Learner.load_state_dict(ck["Fast_Learner_sd"])
+        Fast_opt.load_state_dict(ck["Fast_opt_sd"])
+        Target_net.load_state_dict(ck["Target_net_sd"])
+        Meta_Learner.load_state_dict(ck["Meta_Learner_sd"])
+        Meta_opt.load_state_dict(ck["Meta_opt_sd"])
+        Meta_scheduler.load_state_dict(ck["Meta_scheduler_sd"])
+
+        # Restore replay buffers
+        exp_replay_fast.memory.clear()
+        exp_replay_fast.memory.extend(ck["exp_replay_fast_mem"])
+        exp_replay_fast2meta.memory.clear()
+        exp_replay_fast2meta.memory.extend(ck["exp_replay_fast2meta_mem"])
+        exp_replay_meta.memory.clear()
+        exp_replay_meta.memory.extend(ck["exp_replay_meta_mem"])
+
+        # Restore detector internal state (best-effort)
+        if detector is not None and ck.get("detector_state") is not None:
+            try:
+                import io
+                restored_core = pickle.load(io.BytesIO(ck["detector_state"]))
+                detector.core = restored_core
+                print("[checkpoint] detector state restored.")
+            except Exception as exc:
+                print(f"[checkpoint] warning: could not restore detector state: {exc}")
+
+        # Restore environment to the correct game
+        env = CL_envs_func_replacement(seq=args.seq, game_id=gameid,
+                                       seed=args.seed)
+        print(f"[checkpoint] Resumed from step {step}, gameid={gameid}, "
+              f"prev elapsed={_elapsed_time_prev_sessions:.1f}s")
+    else:
+        print(f"[checkpoint] No checkpoint found; starting fresh.")
+
+    cs = env.reset()
+    print(f"##### Env {gameid+1}: {env.game_name}")
+
+    pbar = tqdm(total=args.t_steps, initial=step)
 
     num_envs = max(1, args.t_steps // args.switch)
     is_oracle = detector_kind == "oracle"
     is_boundary_free = not is_oracle
+    _last_checkpoint_step = step  # track when we last saved
+    _det_pending = None  
 
-    # ------------------------------------------------------------------
-    # Mid-training checkpoint: resume if a checkpoint exists for this run
-    # ------------------------------------------------------------------
-    _ckpt_enabled = (args.checkpoint_every > 0)
-    _ckpt_file = (_ckpt_path(args.checkpoint_dir, filename)
-                  if _ckpt_enabled else None)
-
-    if _ckpt_enabled and os.path.exists(_ckpt_file):
-        _bk = load_checkpoint(
-            _ckpt_file, device,
-            Fast_Learner, Fast_opt,
-            Meta_Learner, Meta_opt,
-            Target_net, snapshots, detector,
-            exp_replay_fast, exp_replay_fast2meta, exp_replay_meta,
-        )
-        step              = _bk["step"]
-        gameid            = _bk["gameid"]
-        Games             = _bk["games"]
-        returns_array     = _bk["returns_array"]
-        oracle_boundaries = _bk["oracle_boundaries"]
-        detected_boundaries = _bk["detected_boundaries"]
-        detection_log     = _bk["detection_log"]
-        flag_history      = _bk["flag_history"]
-        avg_return        = _bk["avg_return"]
-        epi_return        = _bk["epi_return"]
-        meta_warmup       = _bk["meta_warmup"]
-        # Rebuild env at the restored gameid so the agent interacts with
-        # the right game from where it left off.
-        env = CL_envs_func_replacement(seq=args.seq, game_id=gameid,
-                                       seed=args.seed)
-        print(f"[ckpt] resumed at step={step}  gameid={gameid}  "
-              f"game={env.game_name}")
-    else:
-        cs = env.reset()
-        print(f"##### Env {gameid+1}: {env.game_name}")
-
-    cs = env.reset()   # always reset to a clean episode state on (re)start
-
-    pbar = tqdm(total=args.t_steps, initial=step)
-
-    # ------------------------------------------------------------------
-    # Main interaction loop
-    # ------------------------------------------------------------------
     while step < args.t_steps:
 
-        # ---------- silent env switch (truth label for evaluation) ----------
         if step > 0 and step % args.switch == 0 and gameid + 1 < num_envs:
             gameid += 1
             env = CL_envs_func_replacement(seq=args.seq, game_id=gameid,
@@ -844,6 +810,14 @@ def main():
             oracle_boundaries.append(step)
             print(f"[oracle switch @ step {step}] -> {env.game_name} "
                   f"(gameid={gameid})")
+            # Flush the pending-phi buffer.  cs is now the new env's reset
+            # state, so phi computed at this step will be phi(new_reset), not
+            # phi(ns_prev).  Without this flush, the buffered transition from
+            # the last step of the old task would be fed detector.step() with
+            # a next_phi from a completely different environment -- corrupting
+            # the dynamics error for that one boundary transition.
+            # The lost transition (1 per task switch) is negligible.
+            _det_pending = None
             if is_oracle:
                 # Oracle mode: fire FAME immediately.
                 avg_return = 0.0 if args.reset == 1 else avg_return
@@ -926,19 +900,55 @@ def main():
         returns_array[step] = avg_return
 
         # ---------- detection feed ----------
-        # Compute next_phi lazily (a single extra forward pass on `ns`).
-        # This is only done in boundary-free modes that need it.
         if is_boundary_free:
             if detector_kind == "swoks":
-                next_phi = None  # ignored by the adapter for swoks
-            else:
-                with torch.no_grad():
-                    _q, next_phi_t = Fast_Learner(
-                        _obs_to_tensor(ns, device), return_latent=True
-                    )
-                next_phi = next_phi_t[0].detach().cpu().numpy()
+                # SWOKS needs no next_phi -- call immediately.
+                fired = detector.step(phi, c_action, rew, None)
 
-            fired = detector.step(phi, c_action, rew, next_phi)
+            else:
+                # --- Buffered next_phi for implicit / hybrid ---
+                #
+                # We buffer the current step's transition and resolve next_phi
+                # at the *next* iteration, when phi_{t+1} is already available
+                # from the policy's own forward pass (zero extra cost).
+                #
+                # The only exception is a terminal step (done=True): after a
+                # done, cs is set to env.reset() so phi at t+1 is phi_reset,
+                # NOT phi(ns).  We detect this via prev_done and perform one
+                # targeted Fast_Learner(prev_ns) call only in that case.
+                #
+                # After a detection fires, trigger.run() replaces Fast_Learner
+                # weights and advances cs to a post-warmup state.  Any buffered
+                # transition from before the trigger would produce a next_phi
+                # computed by the NEW network on the POST-warmup cs, which is
+                # wrong.  We therefore flush _det_pending to None on every fire
+                # so the first post-detection step starts the buffer fresh.
+                fired = False
+                if _det_pending is not None:
+                    prev_phi, prev_action, prev_rew, prev_done, prev_ns = \
+                        _det_pending
+                    if not prev_done:
+                        # Non-terminal: cs at this step == ns from prev step,
+                        # so phi (just computed above) IS phi(prev_ns). Reuse.
+                        next_phi_prev = phi
+                    else:
+                        # Terminal: cs was reset to a new episode start, so
+                        # phi here is phi(reset_state) != phi(ns_prev).
+                        # Pay one forward pass only for this step.
+                        with torch.no_grad():
+                            _, _npt = Fast_Learner(
+                                _obs_to_tensor(prev_ns, device),
+                                return_latent=True
+                            )
+                        next_phi_prev = _npt[0].detach().cpu().numpy()
+
+                    fired = detector.step(
+                        prev_phi, prev_action, prev_rew, next_phi_prev
+                    )
+
+                # Buffer THIS step for the next iteration.
+                _det_pending = (phi, c_action, rew, done, ns)
+
             if fired:
                 true_switch = oracle_boundaries[-1] if oracle_boundaries else 0
                 # Per-detector introspection for the log line.
@@ -976,7 +986,7 @@ def main():
                 if exp_replay_meta.size() > 0 or exp_replay_fast2meta.size() > 0:
                     print("  running meta update on streamed fast2meta")
                     Meta_opt_local = optim.Adam(Meta_Learner.parameters(),
-                                                lr=args.lr1)
+                                               lr=args.lr1)
                     Meta_scheduler_local = ExponentialLR(Meta_opt_local,
                                                          gamma=0.95)
                     if exp_replay_meta.size() >= args.batch_size:
@@ -1019,6 +1029,10 @@ def main():
                 }
                 entry.update(fire_meta)
                 detection_log.append(entry)
+                # Flush the pending buffer: trigger.run() replaces Fast_Learner
+                # weights and advances cs, so the buffered phi would produce an
+                # incorrect next_phi on the next iteration.
+                _det_pending = None
 
         # ---------- end of task in oracle mode ----------
         # (Boundary-free modes update the meta learner at each detected
@@ -1043,30 +1057,52 @@ def main():
                            os.path.join(args.models_dir,
                                         f"{filename}_Meta{gameid}.pt"))
 
-        # ---------- periodic mid-training checkpoint ----------
-        if (_ckpt_enabled and step > 0
-                and step % args.checkpoint_every == 0):
-            save_checkpoint(
-                _ckpt_file, step, gameid, Games,
-                returns_array, oracle_boundaries, detected_boundaries,
-                detection_log, flag_history, avg_return, epi_return,
-                meta_warmup,
-                Fast_Learner, Fast_opt,
-                Meta_Learner, Meta_opt,
-                Target_net, snapshots, detector,
-                exp_replay_fast, exp_replay_fast2meta, exp_replay_meta,
-            )
-
         step += 1
         pbar.update(1)
 
+        # ---------- periodic checkpoint ----------
+        if (args.checkpoint_dir
+                and step - _last_checkpoint_step >= args.checkpoint_interval):
+            _elapsed_now = (_elapsed_time_prev_sessions
+                            + time.time() - _session_start_time)
+            save_checkpoint(
+                _checkpoint_path(args.checkpoint_dir, filename),
+                step=step,
+                gameid=gameid,
+                avg_return=avg_return,
+                epi_return=epi_return,
+                meta_warmup=meta_warmup,
+                returns_array=returns_array,
+                oracle_boundaries=oracle_boundaries,
+                detected_boundaries=detected_boundaries,
+                detection_log=detection_log,
+                flag_history=flag_history,
+                Games=Games,
+                snapshots=snapshots,
+                Fast_Learner=Fast_Learner,
+                Fast_opt=Fast_opt,
+                Target_net=Target_net,
+                Meta_Learner=Meta_Learner,
+                Meta_opt=Meta_opt,
+                Meta_scheduler=Meta_scheduler,
+                exp_replay_fast=exp_replay_fast,
+                exp_replay_fast2meta=exp_replay_fast2meta,
+                exp_replay_meta=exp_replay_meta,
+                detector=detector,
+                elapsed_time_so_far=_elapsed_now,
+            )
+            _last_checkpoint_step = step
+
     pbar.close()
 
-    # On clean completion, remove the checkpoint file so a fresh re-run
-    # always starts from scratch (the results pkl is the real artefact).
-    if _ckpt_enabled and os.path.exists(_ckpt_file):
-        os.remove(_ckpt_file)
-        print(f"[ckpt] training complete -- checkpoint removed: {_ckpt_file}")
+    # Compute total training time (accumulated + this session)
+    _total_training_time = (_elapsed_time_prev_sessions
+                            + time.time() - _session_start_time)
+    _total_training_time_str = time.strftime(
+        "%H:%M:%S", time.gmtime(_total_training_time)
+    )
+    print(f"Total training time: {_total_training_time_str} "
+          f"({_total_training_time:.1f}s)")
 
     # ------------------------------------------------------------------
     # Save results
@@ -1083,6 +1119,8 @@ def main():
             "args": vars(args),
             "mode": mode_tag,
             "detector_stats": detector.stats() if detector is not None else None,
+            "total_training_time_seconds": _total_training_time,
+            "total_training_time_hms": _total_training_time_str,
         }
         out_path = os.path.join(args.results_dir, f"{filename}_returns.pkl")
         with open(out_path, "wb") as f:
@@ -1107,6 +1145,8 @@ def main():
     print("Games:", Games)
     print("Oracle boundaries:", oracle_boundaries)
     print("Detected boundaries:", detected_boundaries)
+    print(f"Total training time: {_total_training_time_str} "
+          f"({_total_training_time:.1f}s)")
     print(args)
 
 

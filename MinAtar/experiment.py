@@ -1,64 +1,3 @@
-"""experiment.py -- The unified experiments + results entry point for FAME.
-
-This is *the* script the class presentation / writeup hangs on.  It ingests
-the pickled outputs of FAME.py (returns, boundaries, detection logs, flag
-histories, and -- optionally -- saved final meta/fast weights) and produces,
-for a single invocation:
-
-    results/experiment_<tag>/
-        paper_table.tex             FAME-style main table (LaTeX)
-        paper_table.txt             Same, plain text
-        metrics_per_seed.csv        One row per (mode, seed, sequence)
-        metrics_aggregate.csv       Mean + SE per mode / per task
-        report.md                   Self-contained narrative report
-        plots/
-            learning_curves.png     Smoothed returns, one line per mode
-            detection_timeline_*.png  Oracle vs detected boundaries, per seed
-            detection_delay_hist.png  Histogram of detection delays (TPs)
-            detection_quality.png   TP/FP/F1 per mode (grouped bars)
-            per_task_auc.png        AUC per task for every mode
-            forgetting_heatmap.png  Per-task forgetting per mode
-            warmup_flag_ratio.png   Stacked bar: Fast/Meta/Random warm-up picks
-            hybrid_reason_pie.png   Pie chart of hybrid firing reasons
-            ratio_to_oracle.png     Bar of avg_perf / oracle_avg_perf
-            tolerance_sweep.png     F1 vs detection tolerance for each mode
-            pvalue_trace_*.png      Time-series of log(1/p) per run
-
-Metric conventions match the FAME paper (Sun et al., 2026, Eqs. 9 & forgetting
-definition in Sec. 4):
-
-    Avg. Perf = (1/K) sum_{i=1..K}  p_i(K*T)          (final-policy cross-task)
-    FT_i       = (AUC_i - AUC_b_i) / (1 - AUC_b_i)    (baseline = Reset)
-    AUC_i      = (1/T) * integral_{(i-1)*T}^{i*T}  p_i(t) dt    (normalised [0,1])
-    Forgetting = (1/K) sum_i  p_i(i*T) - p_i(K*T)    (normalised by per-task
-                                                      cross-method std)
-
-FAME-paper-strict metrics (``Avg. Perf``, ``Forgetting`` with end-of-training
-re-evaluation) additionally require the **post-hoc** evaluation mode
-(``--eval-posthoc``), which loads the final meta weights and rolls them for N
-episodes in each of {breakout, space_invaders, freeway}.
-
-Offline proxies are always computed from the training return trace alone
-(no extra env rollouts) -- they correspond to:
-
-    avg_perf_proxy    = mean over the last 2% of the return trace
-    forgetting_proxy  = (mean return in last 5% of each task during training)
-                        - (mean return in last 5% of whole run)
-
-Both offline and post-hoc metrics land in the CSV so plots and tables can
-choose the appropriate column.
-
-CLI
----
-    python experiment.py                          # default: all, auto-discover
-    python experiment.py --eval-posthoc           # include post-hoc rollouts
-    python experiment.py --only-plots             # re-run visualisations only
-    python experiment.py --seq 0 --seeds 1 2 3
-    python experiment.py --out_dir results/demo
-
-See the argparse --help for the full list.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -206,7 +145,21 @@ def forgetting_proxy(returns: np.ndarray,
                      boundaries: Sequence[int],
                      total_steps: int,
                      window: int = 5000) -> Tuple[float, List[float]]:
-    """Training-trace forgetting proxy: (end-of-task mean) - (end-of-run mean)."""
+    """Training-trace forgetting proxy: (end-of-task mean) - (end-of-run mean).
+
+    KNOWN LIMITATIONS (see per_game_metrics for fixes):
+    - end-of-run is the EMA on whatever game is *last* in the sequence; for
+      tasks of a different game this is comparing apples to oranges.
+    - methods that correctly identify same-game transitions (e.g. SWOKS on
+      seq=0 task 4->5, both space_invaders) accumulate higher peaks and
+      therefore score higher "forgetting" values purely because they had
+      more skill to lose.  The metric conflates "learned a lot" with
+      "forgot a lot".
+
+    Kept here for backward compatibility with the FAME paper's reported
+    proxy.  For analysis we now also emit per_game_metrics() below, which
+    properly evaluates each game's last training window separately.
+    """
     edges = list(boundaries) + [total_steps]
     end_win = returns[max(0, total_steps - window):total_steps].mean()
     per_task = []
@@ -216,6 +169,98 @@ def forgetting_proxy(returns: np.ndarray,
         per_task.append(float(win - end_win))
     agg = float(np.mean(per_task)) if per_task else 0.0
     return agg, per_task
+
+
+def per_game_metrics(returns: np.ndarray,
+                     boundaries: Sequence[int],
+                     games: Sequence[str],
+                     total_steps: int,
+                     window: int = 5000) -> dict:
+    """Game-aware training-trace metrics.
+
+    Three metrics, all computed per unique game in the sequence:
+
+    * `last_window`   : mean EMA return in the last `window` steps of the
+                        LAST task that was this game.  Best training-trace
+                        proxy for "current skill on game g".
+    * `peak_window`   : max over all tasks of game g of the end-of-task
+                        window mean.  "Best the method ever got on g".
+    * `retention`     : last_window / peak_window  (clipped to [0, inf]).
+                        Bounded ~[0, 1] under normal training; > 1 if the
+                        last occurrence somehow exceeds the historical
+                        peak.  This is the right way to talk about
+                        forgetting because it doesn't penalise methods
+                        that simply learned more (the original
+                        forgetting_proxy does).
+
+    Aggregate averages across games are also returned.
+
+    Why this is better than avg_perf_proxy and forgetting_proxy:
+    - Equal weight per game, not per task.  seq=0 has 4 tasks of breakout
+      (tasks 1, 3, 7) and 3 of space_invaders (2, 4, 5) and 1 of freeway
+      (6).  avg_perf_proxy weights them by sequence position; this
+      weights them by uniqueness.
+    - Uses the most recent training window for each game, so it answers
+      the question "after the full curriculum, how good is the method at
+      each game?" without any post-hoc rollouts.
+    - retention is bounded and meaningful: 1.0 means "you still have
+      everything you ever learned"; 0.0 means "complete forgetting".
+    """
+    edges = [0] + list(boundaries) + [total_steps]
+    # task_windows[task_idx] = (start, end, end_win_mean, max_in_task)
+    task_info = []
+    for i, (s, e) in enumerate(zip(edges[:-1], edges[1:])):
+        e = int(e); s = int(s)
+        if e <= s:
+            continue
+        end_win = float(returns[max(s, e - window):e].mean())
+        task_info.append((i, s, e, end_win))
+
+    by_game = {}  # game -> list of (task_idx, end_win)
+    for (i, s, e, ew) in task_info:
+        if i >= len(games):
+            continue
+        g = games[i]
+        by_game.setdefault(g, []).append((i, ew))
+
+    # Retention threshold: if a game's peak end-of-task return is below this
+    # the method never really learned that game, so retention is undefined
+    # (you can't "forget" what you never knew).  Without this, the freeway
+    # game on seq=0 -- which most methods score ~0 on -- would contribute a
+    # spurious retention=1.0 to every method's average and drag the metric
+    # toward meaninglessness.
+    MIN_PEAK_FOR_RETENTION = 1.0
+
+    per_game_last = {}    # most-recent-occurrence end window per game
+    per_game_peak = {}    # max end window across all occurrences of game
+    per_game_retention = {}    # only populated for games with peak >= MIN
+    for g, occs in by_game.items():
+        if not occs:
+            continue
+        last_ew = occs[-1][1]
+        peak_ew = max(o[1] for o in occs)
+        per_game_last[g] = last_ew
+        per_game_peak[g] = peak_ew
+        if peak_ew >= MIN_PEAK_FOR_RETENTION:
+            per_game_retention[g] = last_ew / peak_ew
+
+    avg_last = float(np.mean(list(per_game_last.values()))) if per_game_last else 0.0
+    avg_peak = float(np.mean(list(per_game_peak.values()))) if per_game_peak else 0.0
+    # Retention is averaged only over games the method actually learned.
+    # If no game was learned, retention is undefined (returned as nan).
+    if per_game_retention:
+        avg_retention = float(np.mean(list(per_game_retention.values())))
+    else:
+        avg_retention = float("nan")
+
+    return {
+        "per_game_last": per_game_last,
+        "per_game_peak": per_game_peak,
+        "per_game_retention": per_game_retention,
+        "avg_last_per_game": avg_last,
+        "avg_peak_per_game": avg_peak,
+        "avg_retention": avg_retention,
+    }
 
 
 # ======================================================================
@@ -361,7 +406,13 @@ class RunSummary:
     avg_perf_proxy: float
     forgetting_proxy_total: float
     forgetting_proxy_per_task: List[float]
-    detection: dict
+    # Game-aware training-trace metrics (proper aggregate; see per_game_metrics)
+    avg_perf_per_game: float = 0.0      # mean across games of last-occurrence window
+    avg_retention: float = 1.0          # mean across games of last_window / peak_window
+    per_game_last: Dict[str, float] = field(default_factory=dict)
+    per_game_peak: Dict[str, float] = field(default_factory=dict)
+    per_game_retention: Dict[str, float] = field(default_factory=dict)
+    detection: dict = field(default_factory=dict)
     # Post-hoc fields (may be None if not evaluated)
     posthoc_avg_perf: Optional[float] = None
     posthoc_per_game: Optional[Dict[str, Tuple[float, float]]] = None
@@ -394,6 +445,7 @@ def summarise_run(path: str, *, tolerance: int) -> RunSummary:
     auc, _ = per_task_auc_normalized(returns, oracle, len(returns))
     avg_p = avg_performance_proxy(returns, tail_frac=0.02)
     forg_total, forg_per = forgetting_proxy(returns, oracle, len(returns))
+    pg = per_game_metrics(returns, oracle, games, len(returns))
     det = match_detections(detected, oracle, tolerance=tolerance)
 
     reasons = Counter(
@@ -410,6 +462,11 @@ def summarise_run(path: str, *, tolerance: int) -> RunSummary:
         avg_perf_proxy=avg_p,
         forgetting_proxy_total=forg_total,
         forgetting_proxy_per_task=forg_per,
+        avg_perf_per_game=pg["avg_last_per_game"],
+        avg_retention=pg["avg_retention"],
+        per_game_last=pg["per_game_last"],
+        per_game_peak=pg["per_game_peak"],
+        per_game_retention=pg["per_game_retention"],
         detection=det,
         hybrid_reasons=reasons,
         filepath=path,
@@ -917,7 +974,9 @@ def plot_hybrid_vs_implicit_timeline(summaries_by_mode: Dict[str, List[RunSummar
 def write_per_seed_csv(summaries_by_mode: Dict[str, List[RunSummary]],
                        norm_forg: Dict[str, List[float]],
                        out_path: str) -> None:
-    header = ("mode,seed,seq,n_steps,avg_perf_proxy,mean_auc,mean_ft,"
+    header = ("mode,seed,seq,n_steps,avg_perf_proxy,avg_perf_per_game,"
+              "avg_retention,per_game_last,per_game_peak,per_game_retention,"
+              "mean_auc,mean_ft,"
               "forgetting_proxy,forgetting_normalised,"
               "tp,fp,fn,precision,recall,f1,mean_delay,max_delay,"
               "num_oracle,num_detected,posthoc_avg_perf\n")
@@ -932,10 +991,17 @@ def write_per_seed_csv(summaries_by_mode: Dict[str, List[RunSummary]],
                 norm_f = np.mean(norm_forg.get(mode, []))
                 posthoc = (f"{r.posthoc_avg_perf:.4f}"
                            if r.posthoc_avg_perf is not None else "")
+                # Encode per-game dicts as ;-separated key=value strings so
+                # CSV stays one-row-per-seed.
+                pg_last = ";".join(f"{k}={v:.2f}" for k, v in r.per_game_last.items())
+                pg_peak = ";".join(f"{k}={v:.2f}" for k, v in r.per_game_peak.items())
+                pg_ret = ";".join(f"{k}={v:.3f}" for k, v in r.per_game_retention.items())
                 d = r.detection
                 f.write(
                     f"{mode},{r.seed},{r.seq},{r.n_steps},"
-                    f"{r.avg_perf_proxy:.4f},{mean_auc:.4f},{mean_ft:.4f},"
+                    f"{r.avg_perf_proxy:.4f},{r.avg_perf_per_game:.4f},"
+                    f"{r.avg_retention:.4f},{pg_last},{pg_peak},{pg_ret},"
+                    f"{mean_auc:.4f},{mean_ft:.4f},"
                     f"{r.forgetting_proxy_total:.4f},"
                     f"{float(norm_f) if np.isfinite(norm_f) else 0.0:.4f},"
                     f"{d['tp']},{d['fp']},{d['fn']},"
@@ -969,6 +1035,13 @@ def build_paper_table(summaries_by_mode: Dict[str, List[RunSummary]],
             continue
         # Avg Perf (proxy)
         ap = [r.avg_perf_proxy for r in runs]
+        # Game-aware avg perf (mean across games of last-occurrence window).
+        # Equally weights each game; doesn't favour whatever game is last.
+        ap_pg = [r.avg_perf_per_game for r in runs]
+        # Per-game retention (last_window / peak_window, averaged across games)
+        # Bounded ~[0, 1]; replaces forgetting_norm as the principled forgetting
+        # measure that doesn't penalise methods that learned more.
+        retention = [r.avg_retention for r in runs]
         # Post-hoc Avg Perf when available
         ap_post = [r.posthoc_avg_perf for r in runs
                    if r.posthoc_avg_perf is not None]
@@ -987,6 +1060,8 @@ def build_paper_table(summaries_by_mode: Dict[str, List[RunSummary]],
         row = {
             "n_seeds": str(len(runs)),
             "avg_perf_proxy": _agg(ap, "{:.2f}", sep=sep),
+            "avg_perf_per_game": _agg(ap_pg, "{:.2f}", sep=sep),
+            "avg_retention": _agg(retention, "{:.3f}", sep=sep),
             "avg_perf_posthoc": _agg(ap_post, "{:.2f}", sep=sep) if ap_post else "-",
             "forward_transfer": _agg(ft, "{:.3f}", sep=sep) if ft else "-",
             "forgetting_norm": f"{float(np.mean(f_norm)):+.3f}" if f_norm else "-",
@@ -999,7 +1074,8 @@ def build_paper_table(summaries_by_mode: Dict[str, List[RunSummary]],
 
 
 def write_paper_table_txt(rows, out_path: str) -> None:
-    cols = ["mode", "n_seeds", "avg_perf_proxy", "avg_perf_posthoc",
+    cols = ["mode", "n_seeds", "avg_perf_proxy", "avg_perf_per_game",
+            "avg_retention", "avg_perf_posthoc",
             "forward_transfer", "forgetting_norm",
             "det_F1", "det_delay", "tp_fp_fn"]
     widths = {c: max(len(c), 14) for c in cols}
@@ -1073,7 +1149,8 @@ def write_report_md(summaries_by_mode: Dict[str, List[RunSummary]],
     lines.append("")
     lines.append("## Main results")
     lines.append("")
-    cols = ["mode", "n_seeds", "avg_perf_proxy", "avg_perf_posthoc",
+    cols = ["mode", "n_seeds", "avg_perf_proxy", "avg_perf_per_game",
+            "avg_retention", "avg_perf_posthoc",
             "forward_transfer", "forgetting_norm",
             "det_F1", "det_delay", "tp_fp_fn"]
     lines.append("| " + " | ".join(cols) + " |")
@@ -1108,16 +1185,38 @@ def write_report_md(summaries_by_mode: Dict[str, List[RunSummary]],
     lines.append("## Notes on metrics")
     lines.append("")
     lines.append("- **AvgPerf (proxy)** is the mean return over the last 2%"
-                 " of the training trace.  Fast to compute, noisy on short runs.")
+                 " of the training trace.  KNOWN PROBLEM: this only sees the"
+                 " final task in the sequence (e.g. for seq=0 only the last"
+                 " 70k steps of breakout).  It rewards methods that happen to"
+                 " be good at whatever the last game is, not continual-learning"
+                 " ability per se.  Reported for FAME-paper comparability.")
+    lines.append("- **AvgPerf (per_game)** is a fairer training-trace proxy:"
+                 " for each unique game in the sequence, take the mean return"
+                 " in the last 5000 steps of that game's most recent task."
+                 " Then average across games.  Equally weights every game"
+                 " regardless of how often or where it appears in the"
+                 " sequence.  Higher = better.")
+    lines.append("- **Avg Retention** is the mean across games of"
+                 " (last_window / peak_window) where peak is the max"
+                 " end-of-task window across all occurrences of that game."
+                 " Bounded ~[0, 1].  Replaces the FAME forgetting metric"
+                 " with one that doesn't penalise methods for learning more:"
+                 " a method that learnt a peak of 50 and lost down to 25"
+                 " has the same retention (0.5) as one that peaked at 10"
+                 " and lost down to 5.")
     lines.append("- **AvgPerf (posthoc)** loads the final *meta* learner and"
                  " rolls it for N episodes in each of {breakout, space_invaders,"
                  " freeway}; averaged across games.  Matches the FAME paper's"
-                 " $(1/K)\\sum_i p_i(K\\cdot T)$ exactly.")
+                 " $(1/K)\\sum_i p_i(K\\cdot T)$ exactly.  This is the gold"
+                 " standard when MetaFinal.pt weights are available.")
     lines.append("- **Forward Transfer** compares per-task AUC against the"
                  " baseline mode (Oracle by default, standing in for Reset).")
-    lines.append("- **Forgetting** is the per-task end-of-task minus"
-                 " end-of-run training-trace mean, then normalised by the"
-                 " cross-method standard deviation per task (as in the paper).")
+    lines.append("- **Forgetting (norm)** is the FAME paper's metric:"
+                 " per-task (end-of-task - end-of-run), normalised by the"
+                 " cross-method std per task.  KNOWN PROBLEM: the end-of-run"
+                 " window is on whatever game is *last*, while end-of-task is"
+                 " on a potentially different game.  Reported for paper"
+                 " comparability; prefer Avg Retention.")
     lines.append("- **Detection F1** uses greedy 1-to-1 matching of detected"
                  " boundaries to oracle switches within `tolerance` steps.")
     with open(out_path, "w") as f:
@@ -1206,10 +1305,12 @@ def run_experiment(args: argparse.Namespace) -> None:
     # Aggregate CSV (for quick reference).
     agg_path = os.path.join(out_dir, "metrics_aggregate.csv")
     with open(agg_path, "w") as f:
-        f.write("mode,n,avg_perf_proxy,avg_perf_posthoc,forward_transfer,"
+        f.write("mode,n,avg_perf_proxy,avg_perf_per_game,avg_retention,"
+                "avg_perf_posthoc,forward_transfer,"
                 "forgetting_norm,det_F1,det_delay,TP,FP,FN\n")
         for m, r in rows:
             f.write(",".join([m, r["n_seeds"], r["avg_perf_proxy"],
+                              r["avg_perf_per_game"], r["avg_retention"],
                               r["avg_perf_posthoc"], r["forward_transfer"],
                               r["forgetting_norm"], r["det_F1"],
                               r["det_delay"], r["tp_fp_fn"]]) + "\n")

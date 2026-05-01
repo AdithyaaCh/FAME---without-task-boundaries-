@@ -1,31 +1,3 @@
-"""
-SWOKS-based task-shift detector for boundary-free FAME.
-
-Implements Approach 1 from the proposal (Section 3.4): statistical detection
-on a shared latent action-reward feature space via Sliced Wasserstein Distance
-(SWD) + one-sided Kolmogorov-Smirnov (KS) test with an upward adjustment.
-
-Design decisions (tied to the research proposal):
-  * Per-step detection feature  d_t = [phi_t, a_t, sqrt(|phi|) * r_t]
-    where phi_t is the penultimate feature of the fast learner (Eq. 5).
-    This avoids training a separate encoder and reuses the policy forward pass.
-  * Two rolling windows W_ref and W_cur of size L_D each hold detection
-    features (Eq. 6).  Once per detection interval we compute SWD between
-    them, maintaining the last 2*L_W SWD values as a history.
-  * Detection fires when KS(W_new_z, W_old_z * beta) < alpha (Eq. 8-10).
-    beta > 1 is a conservative upward adjustment on the reference SWDs that
-    curbs false positives from within-task drift.
-  * A stable-phase guard suppresses detection for `stable_phase` steps after
-    every confirmed shift.  This mirrors the SWOKS paper's solution to the
-    "drift during learning" problem.
-  * Optional `max_wait` fallback: if no detection has fired for a long time
-    AND the short-term SWD is much larger than a baseline, force a probe.
-    This guards against false negatives when the KS adjustment is too strong.
-
-This module is intentionally free of torch/env dependencies so it can be
-unit-tested and reused across backends (MinAtar / Atari PPO / Meta-World).
-"""
-
 import math
 from collections import deque
 
