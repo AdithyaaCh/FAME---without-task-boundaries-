@@ -1,8 +1,14 @@
 # Boundary-Free Continual Reinforcement Learning via Statistical and Implicit Task-Shift Detection in FAME
 
+**Based on the paper:**
+**"Principled Fast and Meta Knowledge Learners for Continual Reinforcement Learning"**
+
+**Accepted at the Continual Reinforcement Learning (CRL) Workshop 2026**
+
 This repository contains the implementation of a **boundary-free extension of FAME (Fast and Meta Knowledge Learners for Continual Reinforcement Learning)** by replacing the assumption of known task boundaries with an online **Task-Shift Detection Module (TSDM)**.
 
-In realistic environments, task switches are rarely announced. This project studies how an RL agent can autonomously detect environment changes and trigger knowledge transfer without access to an oracle boundary signal.
+In realistic environments, task switches are rarely announced. This work studies how a continual reinforcement learning agent can autonomously detect environment changes and trigger knowledge transfer without access to an oracle boundary signal.
+
 
 ## Overview
 
