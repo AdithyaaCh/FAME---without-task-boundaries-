@@ -46,9 +46,9 @@ A distribution-based detector using:
 
 The detector operates on latent action–reward features:
 
-\[
+$$
 d_t = [\phi_t, a_t, r_t/\sqrt{|\phi|}]
-\]
+$$
 
 where:
 
@@ -92,9 +92,9 @@ Neutral → Suspect → Fire
 
 Evidence fusion uses:
 
-\[
+$$
 -\log(p_{imp})-\log(p_{stat})
-\]
+$$
 
 to combine independent statistical evidence.
 
