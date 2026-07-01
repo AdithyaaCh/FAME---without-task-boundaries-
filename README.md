@@ -190,32 +190,6 @@ False-positive detections in implicit/hybrid methods caused unnecessary FAME res
 
 ---
 
-# Repository Structure
-
-
-.
-├── models/
-│   ├── dqn.py
-│   └── architectures
-│
-├── detectors/
-│   ├── swoks_detector.py
-│   ├── implicit_detector.py
-│   └── hybrid_detector.py
-│
-├── environments/
-│   └── CL_envs.py
-│
-├── training/
-│   └── train.py
-│
-├── plots/
-│
-└── README.md
-
-
-
----
 
 # Installation
 
